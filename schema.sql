@@ -54,16 +54,22 @@ create table if not exists public.categories (
 
 create table if not exists public.orders (
   id uuid primary key default gen_random_uuid(),
+  user_id uuid references auth.users(id) on delete cascade,
   order_number text not null unique,
   customer_name text not null,
   phone text not null,
   address text not null,
   notes text not null default '',
   items jsonb not null default '[]'::jsonb,
+  payment_method text not null default 'cod' check (payment_method in ('cod','card','wallet')),
+  cash_change_for numeric(10,2) check (cash_change_for is null or cash_change_for >= 0),
   total numeric(10,2) not null check (total >= 0),
   status text not null default 'جديد' check (status in ('جديد','قيد التجهيز','خرج للتوصيل','تم التوصيل','ملغي')),
   created_at timestamptz not null default now()
 );
+alter table public.orders add column if not exists user_id uuid references auth.users(id) on delete cascade;
+alter table public.orders add column if not exists payment_method text not null default 'cod';
+alter table public.orders add column if not exists cash_change_for numeric(10,2);
 
 create table if not exists public.store_settings (
   id integer primary key check (id = 1),
@@ -104,9 +110,9 @@ drop policy if exists "Admin manages categories" on public.categories;
 create policy "Admin manages categories" on public.categories for all to authenticated using (public.is_market_admin()) with check (public.is_market_admin());
 
 drop policy if exists "Customers can place orders" on public.orders;
-create policy "Customers can place orders" on public.orders for insert to anon, authenticated with check (status = 'جديد');
+create policy "Signed-in customers place their own orders" on public.orders for insert to authenticated with check (status = 'جديد' and user_id = (select auth.uid()));
 drop policy if exists "Admin reads orders" on public.orders;
-create policy "Admin reads orders" on public.orders for select to authenticated using (public.is_market_admin());
+create policy "Customers and admins read orders" on public.orders for select to authenticated using (user_id = (select auth.uid()) or public.is_market_admin());
 drop policy if exists "Admin updates orders" on public.orders;
 create policy "Admin updates orders" on public.orders for update to authenticated using (public.is_market_admin()) with check (public.is_market_admin());
 
@@ -122,7 +128,8 @@ create policy "Admin manages banners" on public.banners for all to authenticated
 
 grant usage on schema public to anon, authenticated;
 grant select on public.products, public.categories, public.store_settings to anon, authenticated;
-grant insert on public.orders to anon, authenticated;
+revoke insert on public.orders from anon;
+grant insert on public.orders to authenticated;
 grant select, update on public.orders to authenticated;
 grant insert, update, delete on public.products, public.categories, public.store_settings to authenticated;
 grant select on public.banners to anon, authenticated;
