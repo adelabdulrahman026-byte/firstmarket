@@ -63,6 +63,10 @@ create table if not exists public.orders (
   items jsonb not null default '[]'::jsonb,
   payment_method text not null default 'cod' check (payment_method in ('cod','card','wallet')),
   cash_change_for numeric(10,2) check (cash_change_for is null or cash_change_for >= 0),
+  delivery_user_id uuid references auth.users(id) on delete set null,
+  delivery_phone text not null default '',
+  delivery_lat numeric(10,7),
+  delivery_lng numeric(10,7),
   total numeric(10,2) not null check (total >= 0),
   status text not null default 'جديد' check (status in ('جديد','قيد التجهيز','خرج للتوصيل','تم التوصيل','ملغي')),
   created_at timestamptz not null default now()
@@ -70,6 +74,27 @@ create table if not exists public.orders (
 alter table public.orders add column if not exists user_id uuid references auth.users(id) on delete cascade;
 alter table public.orders add column if not exists payment_method text not null default 'cod';
 alter table public.orders add column if not exists cash_change_for numeric(10,2);
+alter table public.orders add column if not exists delivery_user_id uuid references auth.users(id) on delete set null;
+alter table public.orders add column if not exists delivery_phone text not null default '';
+alter table public.orders add column if not exists delivery_lat numeric(10,7);
+alter table public.orders add column if not exists delivery_lng numeric(10,7);
+
+create table if not exists public.customer_addresses (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  label text not null default 'المنزل',
+  recipient_name text not null,
+  phone text not null,
+  address text not null,
+  latitude numeric(10,7),
+  longitude numeric(10,7),
+  is_default boolean not null default false,
+  created_at timestamptz not null default now()
+);
+alter table public.customer_addresses enable row level security;
+drop policy if exists "Customers manage their own addresses" on public.customer_addresses;
+create policy "Customers manage their own addresses" on public.customer_addresses for all to authenticated using (user_id=(select auth.uid())) with check (user_id=(select auth.uid()));
+grant select,insert,update,delete on public.customer_addresses to authenticated;
 
 create table if not exists public.store_settings (
   id integer primary key check (id = 1),
@@ -93,6 +118,53 @@ language sql stable security invoker
 set search_path = ''
 as $$ select coalesce((auth.jwt() -> 'app_metadata' ->> 'role') = 'admin', false); $$;
 
+create or replace function public.is_market_delivery_user(p_user_id uuid) returns boolean
+language sql stable security definer
+set search_path = ''
+as $$ select exists(select 1 from auth.users u where u.id=p_user_id and u.raw_app_meta_data->>'role'='delivery'); $$;
+revoke all on function public.is_market_delivery_user(uuid) from public;
+
+create or replace function public.assign_market_delivery(p_order_id uuid,p_delivery_user_id uuid)
+returns boolean language plpgsql security definer set search_path=''
+as $$
+begin
+  if not public.is_market_admin() or not public.is_market_delivery_user(p_delivery_user_id) then return false; end if;
+  update public.orders set delivery_user_id=p_delivery_user_id,status='قيد التجهيز',
+    delivery_phone=coalesce((select nullif(u.phone,'') from auth.users u where u.id=p_delivery_user_id),delivery_phone)
+  where id=p_order_id and delivery_user_id is null and status='جديد';
+  return found;
+end;
+$$;
+revoke all on function public.assign_market_delivery(uuid,uuid) from public;
+grant execute on function public.assign_market_delivery(uuid,uuid) to authenticated;
+
+create or replace function public.claim_market_delivery_order(p_order_id uuid) returns boolean
+language plpgsql security definer set search_path=''
+as $$
+begin
+  if coalesce(auth.jwt()->'app_metadata'->>'role','') <> 'delivery' then return false; end if;
+  update public.orders set delivery_user_id=(select auth.uid()),status='قيد التجهيز',
+    delivery_phone=coalesce((select nullif(u.phone,'') from auth.users u where u.id=(select auth.uid())),delivery_phone)
+  where id=p_order_id and delivery_user_id is null and status='جديد';
+  return found;
+end;
+$$;
+revoke all on function public.claim_market_delivery_order(uuid) from public;
+grant execute on function public.claim_market_delivery_order(uuid) to authenticated;
+
+create or replace function public.set_market_delivery_status(p_order_id uuid,p_status text) returns boolean
+language plpgsql security definer set search_path=''
+as $$
+begin
+  if coalesce(auth.jwt()->'app_metadata'->>'role','') <> 'delivery' or p_status not in ('خرج للتوصيل','تم التوصيل','ملغي') then return false; end if;
+  update public.orders set status=p_status
+  where id=p_order_id and delivery_user_id=(select auth.uid());
+  return found;
+end;
+$$;
+revoke all on function public.set_market_delivery_status(uuid,text) from public;
+grant execute on function public.set_market_delivery_status(uuid,text) to authenticated;
+
 alter table public.products enable row level security;
 alter table public.categories enable row level security;
 alter table public.orders enable row level security;
@@ -112,9 +184,14 @@ create policy "Admin manages categories" on public.categories for all to authent
 drop policy if exists "Customers can place orders" on public.orders;
 create policy "Signed-in customers place their own orders" on public.orders for insert to authenticated with check (status = 'جديد' and user_id = (select auth.uid()));
 drop policy if exists "Admin reads orders" on public.orders;
-create policy "Customers and admins read orders" on public.orders for select to authenticated using (user_id = (select auth.uid()) or public.is_market_admin());
+drop policy if exists "Customers and admins read orders" on public.orders;
+drop policy if exists "Customers admins and assigned delivery read orders" on public.orders;
+drop policy if exists "Delivery sees available new orders" on public.orders;
+create policy "Customers admin and delivery read allowed orders" on public.orders for select to authenticated using (user_id=(select auth.uid()) or public.is_market_admin() or delivery_user_id=(select auth.uid()) or (delivery_user_id is null and status='جديد' and coalesce(auth.jwt()->'app_metadata'->>'role','')='delivery'));
 drop policy if exists "Admin updates orders" on public.orders;
-create policy "Admin updates orders" on public.orders for update to authenticated using (public.is_market_admin()) with check (public.is_market_admin());
+drop policy if exists "Admin or assigned delivery updates orders" on public.orders;
+drop policy if exists "Admin or delivery updates allowed orders" on public.orders;
+create policy "Only admins update orders directly" on public.orders for update to authenticated using (public.is_market_admin()) with check (public.is_market_admin());
 
 drop policy if exists "Public can read store settings" on public.store_settings;
 create policy "Public can read store settings" on public.store_settings for select to anon, authenticated using (true);
