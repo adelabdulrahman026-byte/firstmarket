@@ -64,7 +64,10 @@ create table if not exists public.orders (
   payment_method text not null default 'cod' check (payment_method in ('cod','card','wallet')),
   cash_change_for numeric(10,2) check (cash_change_for is null or cash_change_for >= 0),
   delivery_user_id uuid references auth.users(id) on delete set null,
+  delivery_name text not null default '',
   delivery_phone text not null default '',
+  delivery_vehicle text not null default '',
+  delivery_plate text not null default '',
   delivery_lat numeric(10,7),
   delivery_lng numeric(10,7),
   total numeric(10,2) not null check (total >= 0),
@@ -75,7 +78,10 @@ alter table public.orders add column if not exists user_id uuid references auth.
 alter table public.orders add column if not exists payment_method text not null default 'cod';
 alter table public.orders add column if not exists cash_change_for numeric(10,2);
 alter table public.orders add column if not exists delivery_user_id uuid references auth.users(id) on delete set null;
+alter table public.orders add column if not exists delivery_name text not null default '';
 alter table public.orders add column if not exists delivery_phone text not null default '';
+alter table public.orders add column if not exists delivery_vehicle text not null default '';
+alter table public.orders add column if not exists delivery_plate text not null default '';
 alter table public.orders add column if not exists delivery_lat numeric(10,7);
 alter table public.orders add column if not exists delivery_lng numeric(10,7);
 
@@ -91,6 +97,32 @@ create table if not exists public.customer_addresses (
   is_default boolean not null default false,
   created_at timestamptz not null default now()
 );
+
+create or replace function public.is_market_admin() returns boolean
+language sql stable security invoker
+set search_path = ''
+as $$ select coalesce((auth.jwt() -> 'app_metadata' ->> 'role') = 'admin', false); $$;
+
+create table if not exists public.order_messages (
+  id uuid primary key default gen_random_uuid(),
+  order_id uuid not null references public.orders(id) on delete cascade,
+  sender_id uuid not null references auth.users(id) on delete cascade,
+  body text not null check (length(body) between 1 and 2000),
+  created_at timestamptz not null default now()
+);
+create index if not exists order_messages_order_created_idx on public.order_messages(order_id,created_at);
+alter table public.order_messages enable row level security;
+drop policy if exists "Order participants read messages" on public.order_messages;
+create policy "Order participants read messages" on public.order_messages for select to authenticated using (
+  exists(select 1 from public.orders o where o.id=order_id and
+    (o.user_id=(select auth.uid()) or o.delivery_user_id=(select auth.uid()) or public.is_market_admin()))
+);
+drop policy if exists "Order participants send messages" on public.order_messages;
+create policy "Order participants send messages" on public.order_messages for insert to authenticated with check (
+  sender_id=(select auth.uid()) and exists(select 1 from public.orders o where o.id=order_id and
+    (o.user_id=(select auth.uid()) or o.delivery_user_id=(select auth.uid()) or public.is_market_admin()))
+);
+grant select,insert on public.order_messages to authenticated;
 alter table public.customer_addresses enable row level security;
 drop policy if exists "Customers manage their own addresses" on public.customer_addresses;
 create policy "Customers manage their own addresses" on public.customer_addresses for all to authenticated using (user_id=(select auth.uid())) with check (user_id=(select auth.uid()));
@@ -130,7 +162,10 @@ as $$
 begin
   if not public.is_market_admin() or not public.is_market_delivery_user(p_delivery_user_id) then return false; end if;
   update public.orders set delivery_user_id=p_delivery_user_id,status='قيد التجهيز',
-    delivery_phone=coalesce((select nullif(u.phone,'') from auth.users u where u.id=p_delivery_user_id),delivery_phone)
+    delivery_name=coalesce((select nullif(u.raw_user_meta_data->>'full_name','') from auth.users u where u.id=p_delivery_user_id),delivery_name),
+    delivery_phone=coalesce((select coalesce(nullif(u.phone,''),nullif(u.raw_user_meta_data->>'phone','')) from auth.users u where u.id=p_delivery_user_id),delivery_phone),
+    delivery_vehicle=coalesce((select nullif(u.raw_user_meta_data->>'vehicle','') from auth.users u where u.id=p_delivery_user_id),delivery_vehicle),
+    delivery_plate=coalesce((select nullif(u.raw_user_meta_data->>'plate','') from auth.users u where u.id=p_delivery_user_id),delivery_plate)
   where id=p_order_id and delivery_user_id is null and status='جديد';
   return found;
 end;
@@ -144,7 +179,10 @@ as $$
 begin
   if coalesce(auth.jwt()->'app_metadata'->>'role','') <> 'delivery' then return false; end if;
   update public.orders set delivery_user_id=(select auth.uid()),status='قيد التجهيز',
-    delivery_phone=coalesce((select nullif(u.phone,'') from auth.users u where u.id=(select auth.uid())),delivery_phone)
+    delivery_name=coalesce((select nullif(u.raw_user_meta_data->>'full_name','') from auth.users u where u.id=(select auth.uid())),delivery_name),
+    delivery_phone=coalesce((select coalesce(nullif(u.phone,''),nullif(u.raw_user_meta_data->>'phone','')) from auth.users u where u.id=(select auth.uid())),delivery_phone),
+    delivery_vehicle=coalesce((select nullif(u.raw_user_meta_data->>'vehicle','') from auth.users u where u.id=(select auth.uid())),delivery_vehicle),
+    delivery_plate=coalesce((select nullif(u.raw_user_meta_data->>'plate','') from auth.users u where u.id=(select auth.uid())),delivery_plate)
   where id=p_order_id and delivery_user_id is null and status='جديد';
   return found;
 end;
@@ -182,15 +220,18 @@ drop policy if exists "Admin manages categories" on public.categories;
 create policy "Admin manages categories" on public.categories for all to authenticated using (public.is_market_admin()) with check (public.is_market_admin());
 
 drop policy if exists "Customers can place orders" on public.orders;
+drop policy if exists "Signed-in customers place their own orders" on public.orders;
 create policy "Signed-in customers place their own orders" on public.orders for insert to authenticated with check (status = 'جديد' and user_id = (select auth.uid()));
 drop policy if exists "Admin reads orders" on public.orders;
 drop policy if exists "Customers and admins read orders" on public.orders;
 drop policy if exists "Customers admins and assigned delivery read orders" on public.orders;
 drop policy if exists "Delivery sees available new orders" on public.orders;
+drop policy if exists "Customers admin and delivery read allowed orders" on public.orders;
 create policy "Customers admin and delivery read allowed orders" on public.orders for select to authenticated using (user_id=(select auth.uid()) or public.is_market_admin() or delivery_user_id=(select auth.uid()) or (delivery_user_id is null and status='جديد' and coalesce(auth.jwt()->'app_metadata'->>'role','')='delivery'));
 drop policy if exists "Admin updates orders" on public.orders;
 drop policy if exists "Admin or assigned delivery updates orders" on public.orders;
 drop policy if exists "Admin or delivery updates allowed orders" on public.orders;
+drop policy if exists "Only admins update orders directly" on public.orders;
 create policy "Only admins update orders directly" on public.orders for update to authenticated using (public.is_market_admin()) with check (public.is_market_admin());
 
 drop policy if exists "Public can read store settings" on public.store_settings;
